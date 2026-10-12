@@ -1,0 +1,198 @@
+diff --git a/config/vehicle_params.yaml b/config/vehicle_params.yaml
+index 75e9edb..ec7925b 100644
+--- a/config/vehicle_params.yaml
++++ b/config/vehicle_params.yaml
+@@ -1,2 +1,11 @@
+ Lincoln_Wheel_Base: 2.84
+ Lincoln_Steering: 15.8347898
++
++ulc_limit_accel: 1.5
++ulc_limit_decel: 2.0
++ulc_limit_jerk_throttle: 1.0
++ulc_limit_jerk_brake: 1.0
++
++ulc_coast_decel: false
++
++longitudinal_cmd_mode: "accel"
+diff --git a/src/Lincoln_MKZ_Bridge.cpp b/src/Lincoln_MKZ_Bridge.cpp
+index 9c44e99..4866414 100644
+--- a/src/Lincoln_MKZ_Bridge.cpp
++++ b/src/Lincoln_MKZ_Bridge.cpp
+@@ -3,8 +3,11 @@
+ #include <iostream>
+ #include <functional>
+ #include <chrono>
++#include <string>
++#include <vector>
+ 
+ #include "rclcpp/rclcpp.hpp"
++#include "rcl_interfaces/msg/set_parameters_result.hpp"
+ #include "std_msgs/msg/bool.hpp"
+ 
+ /*────────── Autoware messages ──────────*/
+@@ -50,9 +53,31 @@ public:
+     wheel_base = get_parameter("Lincoln_Wheel_Base").as_double();
+     steering_gain = get_parameter("Lincoln_Steering").as_double();
+ 
+-    RCLCPP_INFO(get_logger(), "Lincoln MKZ Bridge initialized with wheel_base=%.2f, steering_gain=%.2f", 
++    RCLCPP_INFO(get_logger(), "Lincoln MKZ Bridge initialized with wheel_base=%.2f, steering_gain=%.2f",
+                 wheel_base, steering_gain);
+ 
++    declare_parameter<double>("ulc_limit_accel", 1.5);
++    declare_parameter<double>("ulc_limit_decel", 2.0);
++    declare_parameter<double>("ulc_limit_jerk_throttle", 1.0);
++    declare_parameter<double>("ulc_limit_jerk_brake", 1.0);
++
++    declare_parameter<bool>("ulc_coast_decel", false);
++
++    declare_parameter<std::string>("longitudinal_cmd_mode", "velocity");
++
++    ulc_limit_accel_ = get_parameter("ulc_limit_accel").as_double();
++    ulc_limit_decel_ = get_parameter("ulc_limit_decel").as_double();
++    ulc_limit_jerk_throttle_ = get_parameter("ulc_limit_jerk_throttle").as_double();
++    ulc_limit_jerk_brake_ = get_parameter("ulc_limit_jerk_brake").as_double();
++    ulc_coast_decel_ = get_parameter("ulc_coast_decel").as_bool();
++    longitudinal_cmd_accel_ =
++        (get_parameter("longitudinal_cmd_mode").as_string() == "accel");
++
++    logUlcLimits();
++
++    param_callback_handle_ = add_on_set_parameters_callback(
++        std::bind(&Lincoln_MKZ_Bridge::onParameterChange, this, _1));
++
+     /*──────────────── Publishers to DBW ────────────────*/
+     gear_pub = create_publisher<ds_dbw_msgs::msg::GearCmd>("/vehicle/gear/cmd", 10);
+     steering_pub = create_publisher<ds_dbw_msgs::msg::SteeringCmd>("/vehicle/steering/cmd", 10);
+@@ -127,6 +152,13 @@ private:
+   double wheel_base;
+   double steering_gain;
+   double curr_steer{0.0};
++
++  double ulc_limit_accel_{1.5};
++  double ulc_limit_decel_{2.0};
++  double ulc_limit_jerk_throttle_{1.0};
++  double ulc_limit_jerk_brake_{1.0};
++  bool ulc_coast_decel_{false};
++  bool longitudinal_cmd_accel_{false};
+   
+   // State variables
+   bool is_clear_override_needed_{false};
+@@ -179,6 +211,88 @@ private:
+   /*──────────────── Timers ────────────────*/
+   rclcpp::TimerBase::SharedPtr turn_signal_timer_;
+ 
++  OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
++
++  void logUlcLimits()
++  {
++    RCLCPP_INFO(get_logger(),
++                "ULC limits: accel=%.2f m/ss, decel=%.2f m/ss, "
++                "jerk_throttle=%.2f m/sss, jerk_brake=%.2f m/sss, coast_decel=%s, "
++                "longitudinal_cmd_mode=%s",
++                ulc_limit_accel_, ulc_limit_decel_,
++                ulc_limit_jerk_throttle_, ulc_limit_jerk_brake_,
++                ulc_coast_decel_ ? "true" : "false",
++                longitudinal_cmd_accel_ ? "ACCEL" : "velocity");
++  }
++
++  rcl_interfaces::msg::SetParametersResult onParameterChange(
++      const std::vector<rclcpp::Parameter> & params)
++  {
++    rcl_interfaces::msg::SetParametersResult result;
++    result.successful = true;
++
++    for (const auto & p : params) {
++      const auto & name = p.get_name();
++      if (name == "ulc_coast_decel") {
++        if (p.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
++          result.successful = false;
++          result.reason = name + " must be a bool";
++          return result;
++        }
++        continue;
++      }
++      if (name == "longitudinal_cmd_mode") {
++        if (p.get_type() != rclcpp::ParameterType::PARAMETER_STRING) {
++          result.successful = false;
++          result.reason = name + " must be a string";
++          return result;
++        }
++        const std::string m = p.as_string();
++        if (m != "velocity" && m != "accel") {
++          result.successful = false;
++          result.reason = name + " must be \"velocity\" or \"accel\"";
++          return result;
++        }
++        continue;
++      }
++      if (name != "ulc_limit_accel" && name != "ulc_limit_decel" &&
++          name != "ulc_limit_jerk_throttle" && name != "ulc_limit_jerk_brake") {
++        continue;
++      }
++      if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
++        result.successful = false;
++        result.reason = name + " must be a double";
++        return result;
++      }
++      const double v = p.as_double();
++      if (!(v > 0.0) || !std::isfinite(v)) {
++        result.successful = false;
++        result.reason = name + " must be finite and greater than 0";
++        return result;
++      }
++    }
++
++    for (const auto & p : params) {
++      const auto & name = p.get_name();
++      if (name == "ulc_limit_accel") {
++        ulc_limit_accel_ = p.as_double();
++      } else if (name == "ulc_limit_decel") {
++        ulc_limit_decel_ = p.as_double();
++      } else if (name == "ulc_limit_jerk_throttle") {
++        ulc_limit_jerk_throttle_ = p.as_double();
++      } else if (name == "ulc_limit_jerk_brake") {
++        ulc_limit_jerk_brake_ = p.as_double();
++      } else if (name == "ulc_coast_decel") {
++        ulc_coast_decel_ = p.as_bool();
++      } else if (name == "longitudinal_cmd_mode") {
++        longitudinal_cmd_accel_ = (p.as_string() == "accel");
++      }
++    }
++
++    logUlcLimits();
++    return result;
++  }
++
+   uint8_t translateGearAutowareToDS(uint8_t autoware_gear)
+   {
+     using AutowareGear = autoware_vehicle_msgs::msg::GearCommand;
+@@ -387,17 +501,22 @@ private:
+     // Longitudinal control via ULC
+     ds_dbw_msgs::msg::UlcCmd ulc_cmd;
+     ulc_cmd.header.stamp = now();
+-    ulc_cmd.cmd_type = ds_dbw_msgs::msg::UlcCmd::CMD_VELOCITY;
+-    ulc_cmd.cmd = msg->longitudinal.velocity;
++    if (longitudinal_cmd_accel_) {
++      ulc_cmd.cmd_type = ds_dbw_msgs::msg::UlcCmd::CMD_ACCEL;
++      ulc_cmd.cmd = msg->longitudinal.acceleration;
++    } else {
++      ulc_cmd.cmd_type = ds_dbw_msgs::msg::UlcCmd::CMD_VELOCITY;
++      ulc_cmd.cmd = msg->longitudinal.velocity;
++    }
+     ulc_cmd.clear = false;
+     ulc_cmd.enable = true;
+-    ulc_cmd.limit_accel = 3;
+-    ulc_cmd.limit_decel = 3;
+-    ulc_cmd.limit_jerk_throttle = 0;
+-    ulc_cmd.limit_jerk_brake = 0;
++    ulc_cmd.limit_accel = ulc_limit_accel_;
++    ulc_cmd.limit_decel = ulc_limit_decel_;
++    ulc_cmd.limit_jerk_throttle = ulc_limit_jerk_throttle_;
++    ulc_cmd.limit_jerk_brake = ulc_limit_jerk_brake_;
+     ulc_cmd.enable_shift = false;
+     ulc_cmd.enable_shift_park = false;
+-    ulc_cmd.coast_decel = false;
++    ulc_cmd.coast_decel = ulc_coast_decel_;
+     ulc_pub->publish(ulc_cmd);
+ 
+     // Lateral control via steering
