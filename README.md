@@ -2,6 +2,14 @@
 
 Code used to switch the Lincoln MKZ Autoware bridge from velocity commands to acceleration commands, and to test the effect on braking smoothness using recorded drives.
 
+## Dataspeed interface
+
+The bridge sends commands through Dataspeed's ULC interface (`ds_dbw_msgs/msg/UlcCmd.msg`).
+
+- Original Dataspeed interface: <https://bitbucket.org/DataspeedInc/dbw_ros/src/ros2/>
+- `UlcCmd.msg`: <https://bitbucket.org/DataspeedInc/dbw_ros/src/ros2/ds_dbw_msgs/msg/UlcCmd.msg>
+- Installed version: on the vehicle.
+
 ## Vehicle-side code
 
 **`bridge_braking_changes.patch`** - changes to the `universe_dbw2_bridge` package:
